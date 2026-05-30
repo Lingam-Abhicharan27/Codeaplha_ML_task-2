@@ -1,0 +1,478 @@
+import os
+import warnings
+warnings.filterwarnings("ignore")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+ 
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+ 
+# ── Librosa / Audio
+import librosa
+import librosa.display
+ 
+# ── Scikit-learn
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing   import LabelEncoder, StandardScaler
+from sklearn.metrics         import (classification_report, confusion_matrix,
+                                     accuracy_score)
+ 
+# ── TensorFlow / Keras
+import tensorflow as tf
+from tensorflow.keras.models     import Sequential, Model
+from tensorflow.keras.layers     import (Dense, Dropout, Conv1D, MaxPooling1D,
+                                          LSTM, BatchNormalization, Flatten,
+                                          Input, GlobalAveragePooling1D)
+from tensorflow.keras.callbacks  import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.utils      import to_categorical
+from tensorflow.keras            import metrics as km
+ 
+# ── Reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+ 
+#  CONFIGURATION
+DATA_PATH   = "./data/ravdess"   # Point to your RAVDESS folder
+SAMPLE_RATE = 22050
+DURATION    = 3                  # seconds per clip
+N_MFCC      = 40
+HOP_LENGTH  = 512
+N_MELS      = 128
+EMOTIONS    = ["neutral", "calm", "happy", "sad", "angry", "fearful", "disgust", "surprised"]
+BATCH_SIZE  = 32
+EPOCHS      = 60
+ 
+# RAVDESS filename emotion code → label mapping
+RAVDESS_EMOTION_MAP = {
+    "01": "neutral",  "02": "calm",     "03": "happy",
+    "04": "sad",      "05": "angry",    "06": "fearful",
+    "07": "disgust",  "08": "surprised"
+}
+
+#  1. FEATURE EXTRACTION
+def extract_features(file_path, sr=SAMPLE_RATE, duration=DURATION):
+    """
+    Extract a rich feature vector from one audio file:
+      - MFCCs (mean + std)          → 80 features
+      - Delta MFCCs (mean + std)    → 80 features
+      - Chroma (mean + std)         → 24 features
+      - Mel Spectrogram (mean+std)  → 256 features
+      - Spectral Contrast (mean)    →  7 features
+      - Zero Crossing Rate          →  1 feature
+      - RMS Energy                  →  1 feature
+    Total: 449 features per sample
+    """
+    try:
+        y, sr = librosa.load(file_path, sr=sr, duration=duration, mono=True)
+        y     = librosa.util.normalize(y)
+ 
+        # Pad / trim to fixed length
+        target_len = sr * duration
+        if len(y) < target_len:
+            y = np.pad(y, (0, target_len - len(y)))
+        else:
+            y = y[:target_len]
+ 
+        features = []
+ 
+        # MFCCs
+        mfcc  = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC, hop_length=HOP_LENGTH)
+        features += list(np.mean(mfcc, axis=1)) + list(np.std(mfcc, axis=1))
+ 
+        # Delta MFCCs
+        delta = librosa.feature.delta(mfcc)
+        features += list(np.mean(delta, axis=1)) + list(np.std(delta, axis=1))
+ 
+        # Chroma
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr, hop_length=HOP_LENGTH)
+        features += list(np.mean(chroma, axis=1)) + list(np.std(chroma, axis=1))
+ 
+        # Mel Spectrogram
+        mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=N_MELS, hop_length=HOP_LENGTH)
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        features += list(np.mean(mel_db, axis=1)) + list(np.std(mel_db, axis=1))
+ 
+        # Spectral Contrast
+        contrast = librosa.feature.spectral_contrast(y=y, sr=sr, hop_length=HOP_LENGTH)
+        features += list(np.mean(contrast, axis=1))
+ 
+        # Zero Crossing Rate
+        zcr = librosa.feature.zero_crossing_rate(y, hop_length=HOP_LENGTH)
+        features.append(np.mean(zcr))
+ 
+        # RMS Energy
+        rms = librosa.feature.rms(y=y, hop_length=HOP_LENGTH)
+        features.append(np.mean(rms))
+ 
+        return np.array(features, dtype=np.float32)
+ 
+    except Exception as e:
+        print(f"  ⚠ Skipping {file_path}: {e}")
+        return None
+ 
+ 
+def load_ravdess_dataset(data_path):
+    """Walk RAVDESS directory tree and extract features + labels."""
+    X, y = [], []
+    for root, _, files in os.walk(data_path):
+        for fname in files:
+            if not fname.endswith(".wav"):
+                continue
+            parts = fname.split("-")
+            if len(parts) < 3:
+                continue
+            emotion_code = parts[2]
+            label = RAVDESS_EMOTION_MAP.get(emotion_code)
+            if label is None:
+                continue
+            feats = extract_features(os.path.join(root, fname))
+            if feats is not None:
+                X.append(feats)
+                y.append(label)
+    return np.array(X), np.array(y)
+ 
+ 
+#  2. SYNTHETIC DATA GENERATOR
+def generate_synthetic_features(n_per_class=150, n_features=449):
+    """
+    Simulate MFCC-like feature distributions per emotion class
+    so the full training/evaluation pipeline can be demonstrated
+    without audio files.
+    """
+    print("  ℹ  RAVDESS dataset not found — using synthetic features.")
+    print("     To use real audio, set DATA_PATH and place .wav files there.\n")
+ 
+    emotions  = EMOTIONS
+    n_classes = len(emotions)
+    X, y      = [], []
+ 
+    # Give each emotion a distinct mean vector so the model can learn
+    rng = np.random.default_rng(42)
+    class_means = rng.uniform(-2, 2, (n_classes, n_features))
+ 
+    for idx, emotion in enumerate(emotions):
+        samples = rng.normal(loc=class_means[idx], scale=0.6,
+                             size=(n_per_class, n_features)).astype(np.float32)
+        X.extend(samples)
+        y.extend([emotion] * n_per_class)
+ 
+    return np.array(X), np.array(y)
+ 
+#  3. MODEL ARCHITECTURES
+def build_dense_model(input_dim, n_classes):
+    """Baseline fully-connected model."""
+    model = Sequential([
+        Input(shape=(input_dim,)),
+        Dense(512, activation="relu"),
+        BatchNormalization(),
+        Dropout(0.4),
+        Dense(256, activation="relu"),
+        BatchNormalization(),
+        Dropout(0.3),
+        Dense(128, activation="relu"),
+        Dropout(0.2),
+        Dense(n_classes, activation="softmax"),
+    ], name="Dense_Baseline")
+    return model
+ 
+ 
+def build_cnn_model(input_dim, n_classes):
+    """1D-CNN over the feature sequence."""
+    model = Sequential([
+        Input(shape=(input_dim, 1)),
+        Conv1D(64,  kernel_size=5, activation="relu", padding="same"),
+        BatchNormalization(),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+ 
+        Conv1D(128, kernel_size=5, activation="relu", padding="same"),
+        BatchNormalization(),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+ 
+        Conv1D(256, kernel_size=3, activation="relu", padding="same"),
+        BatchNormalization(),
+        GlobalAveragePooling1D(),
+        Dropout(0.4),
+ 
+        Dense(128, activation="relu"),
+        Dropout(0.3),
+        Dense(n_classes, activation="softmax"),
+    ], name="CNN_1D")
+    return model
+ 
+ 
+def build_lstm_model(input_dim, n_classes):
+    """Bidirectional LSTM for temporal emotion patterns."""
+    from tensorflow.keras.layers import Bidirectional
+    model = Sequential([
+        Input(shape=(input_dim, 1)),
+        Bidirectional(LSTM(128, return_sequences=True)),
+        Dropout(0.3),
+        Bidirectional(LSTM(64,  return_sequences=False)),
+        Dropout(0.3),
+        Dense(64, activation="relu"),
+        Dropout(0.2),
+        Dense(n_classes, activation="softmax"),
+    ], name="BiLSTM")
+    return model
+ 
+ 
+def build_cnn_lstm_model(input_dim, n_classes):
+    """CNN feature extractor → LSTM sequence modeller (best of both)."""
+    from tensorflow.keras.layers import Reshape
+    model = Sequential([
+        Input(shape=(input_dim, 1)),
+        Conv1D(64,  kernel_size=5, activation="relu", padding="same"),
+        BatchNormalization(),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+ 
+        Conv1D(128, kernel_size=3, activation="relu", padding="same"),
+        BatchNormalization(),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.3),
+ 
+        LSTM(128, return_sequences=False),
+        Dropout(0.3),
+ 
+        Dense(64, activation="relu"),
+        Dense(n_classes, activation="softmax"),
+    ], name="CNN_LSTM")
+    return model
+
+#  4. TRAINING HELPER
+def compile_and_train(model, X_train, y_train, X_val, y_val,
+                      epochs=EPOCHS, batch_size=BATCH_SIZE):
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=[km.SparseCategoricalAccuracy()],
+    )
+ 
+    callbacks = [
+        EarlyStopping(monitor="val_loss", patience=12, restore_best_weights=True, verbose=0),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=6, min_lr=1e-6, verbose=0),
+    ]
+ 
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
+        verbose=0,
+    )
+    return history
+ 
+#  5. VISUALISATIONS
+def plot_waveform_and_mfcc(file_path=None, sr=SAMPLE_RATE):
+    """Plot waveform + MFCC spectrogram for one sample."""
+    if file_path and os.path.exists(file_path):
+        y, sr = librosa.load(file_path, sr=sr, duration=DURATION)
+        title = os.path.basename(file_path)
+    else:
+        # Generate synthetic audio (sum of sinusoids) for demo
+        t = np.linspace(0, DURATION, sr * DURATION)
+        y = (np.sin(2 * np.pi * 220 * t) * 0.5 +
+             np.sin(2 * np.pi * 440 * t) * 0.3 +
+             np.random.normal(0, 0.05, len(t))).astype(np.float32)
+        title = "Synthetic Audio Demo"
+ 
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC, hop_length=HOP_LENGTH)
+ 
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6))
+ 
+    # Waveform
+    librosa.display.waveshow(y, sr=sr, ax=axes[0], color="#3498db")
+    axes[0].set_title(f"Waveform — {title}", fontsize=12, fontweight="bold")
+    axes[0].set_xlabel("Time (s)")
+    axes[0].set_ylabel("Amplitude")
+ 
+    # MFCC
+    img = librosa.display.specshow(mfcc, sr=sr, hop_length=HOP_LENGTH,
+                                   x_axis="time", ax=axes[1], cmap="coolwarm")
+    axes[1].set_title("MFCC Spectrogram", fontsize=12, fontweight="bold")
+    axes[1].set_ylabel("MFCC Coefficient")
+    fig.colorbar(img, ax=axes[1], format="%+2.0f dB")
+ 
+    plt.tight_layout()
+    plt.savefig("01_waveform_mfcc.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 01_waveform_mfcc.png")
+ 
+ 
+def plot_emotion_distribution(y_labels):
+    counts = pd.Series(y_labels).value_counts()
+    plt.figure(figsize=(9, 4))
+    ax = sns.barplot(x=counts.index, y=counts.values, palette="Set2")
+    ax.set_title("Emotion Class Distribution", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Emotion")
+    ax.set_ylabel("Count")
+    for p in ax.patches:
+        ax.annotate(str(int(p.get_height())),
+                    (p.get_x() + p.get_width() / 2., p.get_height()),
+                    ha="center", va="bottom", fontsize=10)
+    plt.tight_layout()
+    plt.savefig("02_emotion_distribution.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 02_emotion_distribution.png")
+ 
+ 
+def plot_training_history(histories):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    colors = ["#3498db", "#e74c3c", "#2ecc71", "#9b59b6"]
+ 
+    for (name, hist), color in zip(histories.items(), colors):
+        axes[0].plot(hist.history["accuracy"],     color=color, lw=2, label=f"{name} train")
+        axes[0].plot(hist.history["val_accuracy"], color=color, lw=2, linestyle="--", label=f"{name} val")
+        axes[1].plot(hist.history["loss"],         color=color, lw=2, label=f"{name} train")
+        axes[1].plot(hist.history["val_loss"],     color=color, lw=2, linestyle="--", label=f"{name} val")
+ 
+    for ax, title, ylabel in zip(axes, ["Accuracy", "Loss"], ["Accuracy", "Loss"]):
+        ax.set_title(f"Training {title}", fontsize=12, fontweight="bold")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.legend(fontsize=7, ncol=2)
+        ax.grid(alpha=0.3)
+ 
+    plt.tight_layout()
+    plt.savefig("03_training_history.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 03_training_history.png")
+ 
+ 
+def plot_confusion_matrix(y_true, y_pred, class_names, model_name):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(9, 7))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title(f"Confusion Matrix — {model_name}", fontsize=12, fontweight="bold")
+    plt.ylabel("Actual Emotion")
+    plt.xlabel("Predicted Emotion")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    fname = f"04_confusion_matrix_{model_name.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"  ✓ Saved: {fname}")
+ 
+ 
+def plot_model_comparison(results):
+    df = pd.DataFrame(results)
+    plt.figure(figsize=(9, 5))
+    ax = sns.barplot(data=df, x="Model", y="Test Accuracy", palette="viridis")
+    ax.set_title("Model Comparison — Test Accuracy", fontsize=13, fontweight="bold")
+    ax.set_ylim(0, 1.05)
+    for p in ax.patches:
+        ax.annotate(f"{p.get_height():.3f}",
+                    (p.get_x() + p.get_width() / 2., p.get_height()),
+                    ha="center", va="bottom", fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("05_model_comparison.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 05_model_comparison.png")
+ 
+#  6. MAIN PIPELINE
+def main():
+    print("=" * 60)
+    print("  CODEALPHA — TASK 2: EMOTION RECOGNITION FROM SPEECH")
+    print("=" * 60)
+ 
+    # ── 6.1  Load / Generate Data
+    print("\n[1/6] Loading dataset...")
+    if os.path.exists(DATA_PATH):
+        print(f"      Found dataset at: {DATA_PATH}")
+        X, y_labels = load_ravdess_dataset(DATA_PATH)
+    else:
+        X, y_labels = generate_synthetic_features(n_per_class=150)
+ 
+    print(f"      Samples    : {len(X)}")
+    print(f"      Feature dim: {X.shape[1]}")
+    print(f"      Classes    : {np.unique(y_labels).tolist()}")
+ 
+    # ── 6.2  EDA Plots
+    print("\n[2/6] Generating EDA plots...")
+    plot_waveform_and_mfcc()
+    plot_emotion_distribution(y_labels)
+ 
+    # ── 6.3  Encode Labels
+    le       = LabelEncoder()
+    y_enc    = le.fit_transform(y_labels).astype(np.int32)
+    n_classes= len(le.classes_)
+ 
+    # ── 6.4  Scale & Split
+    scaler   = StandardScaler()
+    X_scaled = scaler.fit_transform(X).astype(np.float32)
+ 
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_enc, test_size=0.2, random_state=42, stratify=y_enc
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.15, random_state=42
+    )
+ 
+    # For CNN/LSTM: add channel dim
+    X_train_3d = X_train[..., np.newaxis]
+    X_val_3d   = X_val[..., np.newaxis]
+    X_test_3d  = X_test[..., np.newaxis]
+ 
+    print(f"\n[3/6] Data split — Train:{len(X_train)} | Val:{len(X_val)} | Test:{len(X_test)}")
+ 
+    # ── 6.5  Build & Train Models
+    print("\n[4/6] Training models (this may take a few minutes)...")
+    input_dim = X_train.shape[1]
+ 
+    model_configs = [
+        ("Dense Baseline", build_dense_model(input_dim, n_classes), X_train,    X_val,    X_test),
+        ("CNN-1D",         build_cnn_model(input_dim, n_classes),   X_train_3d, X_val_3d, X_test_3d),
+        ("BiLSTM",         build_lstm_model(input_dim, n_classes),  X_train_3d, X_val_3d, X_test_3d),
+        ("CNN-LSTM",       build_cnn_lstm_model(input_dim, n_classes), X_train_3d, X_val_3d, X_test_3d),
+    ]
+ 
+    histories, results, best_acc, best_model_name, best_preds = {}, [], 0, "", None
+ 
+    for name, model, Xtr, Xv, Xte in model_configs:
+        print(f"      Training: {name}...")
+        hist = compile_and_train(model, Xtr, y_train, Xv, y_val)
+        histories[name] = hist
+ 
+        y_pred_prob = model.predict(Xte, verbose=0)
+        y_pred      = np.argmax(y_pred_prob, axis=1)
+        y_true      = y_test
+        acc         = accuracy_score(y_true, y_pred)
+ 
+        results.append({"Model": name, "Test Accuracy": round(acc, 4)})
+        print(f"        → Test Accuracy: {acc:.4f}")
+ 
+        if acc > best_acc:
+            best_acc        = acc
+            best_model_name = name
+            best_preds      = (y_true, y_pred)
+ 
+    # ── 6.6  Results
+    print("\n[5/6] Evaluation results:")
+    df_res = pd.DataFrame(results)
+    print("\n" + df_res.to_string(index=False))
+    print(f"\n   Best Model: {best_model_name}  (Accuracy = {best_acc:.4f})")
+ 
+    y_true_labels = le.inverse_transform(best_preds[0])
+    y_pred_labels = le.inverse_transform(best_preds[1])
+    print(f"\n  Classification Report — {best_model_name}:")
+    print(classification_report(y_true_labels, y_pred_labels, zero_division=0))
+ 
+    # ── 6.7  Visualisations
+    print("\n[6/6] Saving visualizations...")
+    plot_training_history(histories)
+    plot_confusion_matrix(y_true_labels, y_pred_labels,
+                          le.classes_.tolist(), best_model_name)
+    plot_model_comparison(results)
+ 
+    
+ 
+ 
+if __name__ == "__main__":
+    main()
